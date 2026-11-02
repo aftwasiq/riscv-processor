@@ -136,6 +136,10 @@ architecture behavioral of cpu is
     signal current_instruction : std_logic_vector(31 downto 0);
     signal last_result : std_logic_vector(31 downto 0) := (others => '0');
     signal stop : std_logic := '0';
+
+    -- ADDED: signals connecting to the ALU entity
+    signal alu_a, alu_b, alu_result : std_logic_vector(31 downto 0) := (others => '0');
+    signal alu_op : std_logic_vector(2 downto 0) := "000";
 begin
     pc_out <= std_logic_vector(pc);
     result_out <= last_result;
@@ -149,13 +153,61 @@ begin
         else (others => '0');
     instruction_out <= current_instruction;
 
+    -- ADDED: the ALU instance
+    u_alu : entity work.alu
+        port map (a => alu_a, b => alu_b, op => alu_op, result => alu_result);
+
+    -- ADDED: combinational process that feeds the ALU (operand select + op code)
+    alu_select : process(current_instruction, registers)
+        variable i      : std_logic_vector(31 downto 0);
+        variable funct3 : std_logic_vector(2 downto 0);
+        variable funct7 : std_logic_vector(6 downto 0);
+        variable imm_i, imm_s : std_logic_vector(31 downto 0);
+    begin
+        i      := current_instruction;
+        funct3 := i(14 downto 12);
+        funct7 := i(31 downto 25);
+        imm_i  := std_logic_vector(resize(signed(i(31 downto 20)), 32));
+        imm_s  := (31 downto 12 => i(31)) & i(31 downto 25) & i(11 downto 7);
+
+        alu_a  <= registers(to_integer(unsigned(i(19 downto 15))));   -- rs1
+        alu_b  <= (others => '0');
+        alu_op <= "000";
+
+        case i(6 downto 0) is
+            when "0110011" =>                                          -- R type
+                alu_b <= registers(to_integer(unsigned(i(24 downto 20))));
+                case funct3 is
+                    when "000" => if funct7 = "0100000" then alu_op <= "001"; else alu_op <= "000"; end if;  -- SUB / ADD
+                    when "111" => alu_op <= "010";  -- AND
+                    when "110" => alu_op <= "011";  -- OR
+                    when "100" => alu_op <= "100";  -- XOR
+                    when "001" => alu_op <= "101";  -- SLL
+                    when "101" => alu_op <= "110";  -- SRL
+                    when others => null;
+                end case;
+            when "0010011" => -- I type
+                alu_b <= imm_i;
+                case funct3 is
+                    when "000" => alu_op <= "000";  -- ADDI
+                    when "111" => alu_op <= "010";  -- ANDI
+                    when "110" => alu_op <= "011";  -- ORI
+                    when "100" => alu_op <= "100";  -- XORI
+                    when others => null;
+                end case;
+            when "0000011" => alu_b <= imm_i; alu_op <= "000"; -- LW address = rs1 + imm
+            when "0100011" => alu_b <= imm_s; alu_op <= "000"; -- SW address = rs1 + imm
+            when others => null;
+        end case;
+    end process;
+
     process(clk)
         variable instr : std_logic_vector(31 downto 0);
         variable opcode : std_logic_vector(6 downto 0);
         variable funct3 : std_logic_vector(2 downto 0);
         variable funct7 : std_logic_vector(6 downto 0);
         variable rd, rs1, rs2 : natural range 0 to 31;
-        variable imm_i, imm_s, imm_b : signed(31 downto 0);
+        variable imm_b : signed(31 downto 0);  -- CHANGED: imm_i / imm_s no longer needed here
         variable a, b, value : std_logic_vector(31 downto 0);
         variable next_pc : unsigned(31 downto 0);
         variable write_rd, store_word, valid : boolean;
@@ -176,11 +228,6 @@ begin
                 rd := to_integer(unsigned(instr(11 downto 7)));
                 rs1 := to_integer(unsigned(instr(19 downto 15)));
                 rs2 := to_integer(unsigned(instr(24 downto 20)));
-                imm_i := resize(signed(instr(31 downto 20)), 32);
-                -- Decode S-type immediate without ambiguous concatenation.
-                imm_s(11 downto 5) := signed(instr(31 downto 25));
-                imm_s(4 downto 0) := signed(instr(11 downto 7));
-                imm_s(31 downto 12) := (others => instr(31));
 
                 -- Decode B-type immediate (including the implicit zero bit).
                 imm_b(12) := instr(31);
@@ -199,32 +246,25 @@ begin
                 addr := (others => '0');
 
                 case opcode is
-                    when "0110011" => -- R type
+                    when "0110011" => -- R type: result comes from the ALU
                         write_rd := true;
+                        value := alu_result;
                         case funct3 is
-                            when "000" =>
-                                if funct7 = "0000000" then value := std_logic_vector(unsigned(a) + unsigned(b)); -- ADD
-                                elsif funct7 = "0100000" then value := std_logic_vector(unsigned(a) - unsigned(b)); -- SUB
-                                else valid := false; end if;
-                            when "111" => if funct7 = "0000000" then value := a and b; else valid := false; end if; -- AND
-                            when "110" => if funct7 = "0000000" then value := a or b; else valid := false; end if; -- OR
-                            when "100" => if funct7 = "0000000" then value := a xor b; else valid := false; end if; -- XOR
-                            when "001" => if funct7 = "0000000" then value := std_logic_vector(shift_left(unsigned(a), to_integer(unsigned(b(4 downto 0))))); else valid := false; end if; -- SLL
-                            when "101" => if funct7 = "0000000" then value := std_logic_vector(shift_right(unsigned(a), to_integer(unsigned(b(4 downto 0))))); else valid := false; end if; -- SRL
+                            when "000" => if funct7 /= "0000000" and funct7 /= "0100000" then valid := false; end if;  -- ADD / SUB
+                            when "111" | "110" | "100" | "001" | "101" =>                                              -- AND OR XOR SLL SRL
+                                if funct7 /= "0000000" then valid := false; end if;
                             when others => valid := false;
                         end case;
-                    when "0010011" => -- I type
+                    when "0010011" => -- I type: result comes from the ALU
                         write_rd := true;
+                        value := alu_result;
                         case funct3 is
-                            when "000" => value := std_logic_vector(unsigned(a) + unsigned(imm_i)); -- ADDI
-                            when "111" => value := a and std_logic_vector(imm_i); -- ANDI
-                            when "110" => value := a or std_logic_vector(imm_i); -- ORI
-                            when "100" => value := a xor std_logic_vector(imm_i); -- XORI
+                            when "000" | "111" | "110" | "100" => null;  
                             when others => valid := false;
                         end case;
                     when "0000011" => -- LW
                         if funct3 = "010" then
-                            addr := unsigned(a) + unsigned(imm_i);
+                            addr := unsigned(alu_result);
                             if addr <= to_unsigned(MEM_BYTES - 4, 32) and addr(1 downto 0) = "00" then
                                 value := word_at(memory, to_integer(addr));
                                 write_rd := true;
@@ -232,13 +272,13 @@ begin
                         else valid := false; end if;
                     when "0100011" => -- SW
                         if funct3 = "010" then
-                            addr := unsigned(a) + unsigned(imm_s);
+                            addr := unsigned(alu_result);
                             if addr <= to_unsigned(MEM_BYTES - 4, 32) and addr(1 downto 0) = "00" then
                                 store_word := true;
                                 value := b;
                             else valid := false; end if;
                         else valid := false; end if;
-                    when "1100011" => -- BEQ / BNE
+                    when "1100011" => -- BEQ / BNE 
                         case funct3 is
                             when "000" => if a = b then next_pc := unsigned(signed(pc) + imm_b); end if;
                             when "001" => if a /= b then next_pc := unsigned(signed(pc) + imm_b); end if;
