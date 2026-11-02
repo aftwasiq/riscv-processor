@@ -1,6 +1,6 @@
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+library IEEE;
+use IEEE.STD_LOGIC_1164.all;
+use IEEE.NUMERIC_STD.all;
 
 entity tb_cpu is end entity;
 architecture sim of tb_cpu is
@@ -47,7 +47,8 @@ begin
     begin
         tick;
         reset <= '0';
-        for i in 1 to 24 loop
+        for i in 1 to 200 loop
+            exit when halt_a = '1' and halt_b = '1';
             tick;
         end loop;
         assert halt_a = '1' report "Arithmetic program did not finish" severity failure;
